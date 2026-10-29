@@ -17,6 +17,9 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.experts.mxfp8_emulation_moe import (
     Mxfp8TritonExpertsBase,
 )
+from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+    route_padding_to_expert_zero,
+)
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -118,13 +121,17 @@ class AiterMxfp8Experts(Mxfp8TritonExpertsBase):
         # Route through the graph-safe ``rocm_aiter_fused_moe`` custom op so the
         # call is captured under HIP graphs / torch.compile (a direct
         # ``aiter.fused_moe`` is opaque to the dispatcher). aiter requires FP32
-        # routing weights / INT32 ids.
+        # routing weights / INT32 ids, and indexes experts by those ids, so the
+        # ``-1`` padding sentinel must be remapped first.
+        topk_ids, topk_weights = route_padding_to_expert_zero(
+            topk_ids.to(torch.int32), topk_weights.to(torch.float32)
+        )
         out = rocm_aiter_ops.fused_moe(
             hidden_states,
             w1,
             w2,
-            topk_weights.to(torch.float32),
-            topk_ids.to(torch.int32),
+            topk_weights,
+            topk_ids,
             expert_mask=expert_mask,
             activation_method=ActivationType.Swiglu.value,
             quant_method=QuantType.per_1x32.value,

@@ -8,6 +8,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
@@ -235,6 +236,34 @@ def rocm_aiter_grouped_topk(
     return topk_weights, topk_ids
 
 
+def route_padding_to_expert_zero(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Replace the ``-1`` invalid-route sentinel with a zero-weight expert 0.
+
+    The padding-mask routers mark rows that only exist to pad a batch up to its
+    CUDA-graph shape with ``topk_ids == -1``. AITER's MoE sorting and GEMM
+    kernels index expert tables and their sorted-token buffers by ``topk_ids``
+    without validating them, so a negative id is read as a huge unsigned offset
+    and the gather leaves the expert/workspace buffers. During FULL-graph
+    capture every row is padding, so the very first MoE layer faults the GPU.
+    Padding rows are discarded, hence routing them to expert 0 with zero weight
+    is equivalent and keeps every id in range.
+    """
+    if not is_forward_context_available():
+        return topk_ids, topk_weights
+    is_padding = get_forward_context().is_padding
+    if is_padding is None or is_padding.numel() < topk_ids.shape[0]:
+        return topk_ids, topk_weights
+    assert is_padding.dtype == torch.bool
+    padded_rows = is_padding[: topk_ids.shape[0]].unsqueeze(1)
+    return (
+        topk_ids.masked_fill(padded_rows, 0),
+        topk_weights.masked_fill(padded_rows, 0.0),
+    )
+
+
 def rocm_aiter_fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -282,6 +311,7 @@ def rocm_aiter_fused_experts(
     # All AITER Fused MoE kernels are expecting the following datatypes
     topk_weights = topk_weights.to(torch.float32)
     topk_ids = topk_ids.to(torch.int32)
+    topk_ids, topk_weights = route_padding_to_expert_zero(topk_ids, topk_weights)
 
     # w8a8 per-channel quantization
     if (

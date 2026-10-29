@@ -817,6 +817,87 @@ def test_aiter_moe_dispatch_policy_forwarded_to_fused_moe(
         )
 
 
+# Padding-sentinel remap test ---------------------------------------------
+
+
+def test_aiter_moe_routes_padding_sentinel_to_expert_zero():
+    """AITER must never see the ``-1`` invalid-route sentinel.
+
+    The padding-mask routers mark CUDA-graph padding rows with ``topk_ids ==
+    -1``. AITER's MoE sorting kernel indexes expert tables by those ids, and
+    reads a negative id as a huge unsigned offset, which faults the GPU (seen
+    as "retry page fault" while capturing FULL decode graphs with DSpark, where
+    every row of the capture batch is padding).
+    """
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+        rocm_aiter_fused_experts,
+    )
+
+    _assert_aiter_supported()
+    case = _make_moe_case(
+        num_tokens=8,
+        hidden_dim=256,
+        intermediate_dim=512,
+        num_experts=4,
+        topk=2,
+        seed=7,
+    )
+    w1_shuffled, w2_shuffled = _shuffle_moe_weights(case["w1"], case["w2"])
+    moe_config = make_dummy_moe_config(
+        num_experts=4,
+        experts_per_token=2,
+        hidden_dim=256,
+        intermediate_size=512,
+        in_dtype=torch.bfloat16,
+    )
+
+    is_padding = torch.zeros(8, dtype=torch.bool)
+    is_padding[5:] = True
+    topk_ids = case["topk_ids"].clone()
+    topk_ids[is_padding] = -1
+    topk_weights = case["topk_weights"].clone()
+
+    seen: dict[str, torch.Tensor] = {}
+
+    def fake_fused_moe(hidden_states, w1, w2, topk_weight, ids, *args, **kwargs):
+        seen["ids"] = ids.clone()
+        seen["weights"] = topk_weight.clone()
+        return torch.zeros_like(hidden_states)
+
+    forward_context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata=None,
+        slot_mapping=None,
+        is_padding=is_padding,
+    )
+    with (
+        mock.patch.object(rocm_aiter_ops, "fused_moe", side_effect=fake_fused_moe),
+        override_forward_context(forward_context),
+    ):
+        rocm_aiter_fused_experts(
+            hidden_states=case["hidden_states"],
+            w1=w1_shuffled,
+            w2=w2_shuffled,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            moe_config=moe_config,
+            activation=MoEActivation.SILU,
+        )
+
+    assert (seen["ids"][is_padding] == 0).all(), (
+        "padding rows must route to expert 0, not the -1 sentinel"
+    )
+    assert (seen["weights"][is_padding] == 0).all(), (
+        "padding rows must not contribute expert weight"
+    )
+    torch.testing.assert_close(seen["ids"][~is_padding], topk_ids[~is_padding])
+    torch.testing.assert_close(seen["weights"][~is_padding], topk_weights[~is_padding])
+
+
 # Enum tests --------------------------------------------------------------
 
 
