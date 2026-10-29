@@ -235,6 +235,7 @@ class RankLocalStoreLayout(StoreLayout):
         self._key_prefix = PoolKey.build_prefix(metadata)
         self.kv_caches_base_addr: list[int] = []
         self.block_len: list[int] = []
+        self.page_len: list[int] = []
 
     @property
     def local_shard_ids(self) -> tuple[StoreShardId, ...]:
@@ -269,11 +270,23 @@ class RankLocalStoreLayout(StoreLayout):
         self,
         kv_caches: Sequence[torch.Tensor],
         num_blocks: int,
+        page_lens: Sequence[int] | None = None,
     ) -> None:
+        """Build descriptors from the local KV cache tensors.
+
+        ``block_len`` stays the physical address step between a layer's
+        blocks so addressing is layout-accurate, while ``page_len`` bounds
+        each transfer at one layer's page: block-outermost packing (BLHNC
+        et al.) interleaves every layer's page between two blocks, so a
+        layer view's ``stride(0)`` spans the whole packed block and must not
+        size transfers. ``page_lens`` is parallel to ``kv_caches``.
+        """
         seen_region_ptrs: set[int] = set()
         base_addrs: list[int] = []
         block_lens: list[int] = []
-        for cache in kv_caches:
+        page_lens_out: list[int] = []
+        for idx, cache in enumerate(kv_caches):
+            page = page_lens[idx] if page_lens is not None else None
             storage = cache.untyped_storage()
             storage_addr = storage.data_ptr()
             storage_len = storage.nbytes()
@@ -285,23 +298,36 @@ class RankLocalStoreLayout(StoreLayout):
                     if region_addr in seen_region_ptrs:
                         continue
                     seen_region_ptrs.add(region_addr)
+                    block_len = head_cache.stride(0) * head_cache.element_size()
                     base_addrs.append(region_addr)
-                    block_lens.append(head_cache.stride(0) * head_cache.element_size())
+                    block_lens.append(block_len)
+                    page_lens_out.append(
+                        block_len if page is None else min(page, block_len)
+                    )
             elif cache.stride(0) * cache.element_size() * num_blocks == storage_len:
                 if storage_addr in seen_region_ptrs:
                     continue
                 seen_region_ptrs.add(storage_addr)
+                block_len = storage_len // num_blocks
                 base_addrs.append(storage_addr)
-                block_lens.append(storage_len // num_blocks)
+                block_lens.append(block_len)
+                page_lens_out.append(
+                    block_len if page is None else min(page, block_len)
+                )
             else:
                 region_addr = cache.data_ptr()
                 if region_addr in seen_region_ptrs:
                     continue
                 seen_region_ptrs.add(region_addr)
+                block_len = cache.stride(0) * cache.element_size()
                 base_addrs.append(region_addr)
-                block_lens.append(cache.stride(0) * cache.element_size())
+                block_lens.append(block_len)
+                page_lens_out.append(
+                    block_len if page is None else min(page, block_len)
+                )
         self.kv_caches_base_addr = base_addrs
         self.block_len = block_lens
+        self.page_len = page_lens_out
 
     def prepare_values(
         self,
@@ -320,6 +346,11 @@ class RankLocalStoreLayout(StoreLayout):
             [self.block_len[i % length] for i in range(base.shape[0])],
             dtype=np.int64,
         )
+        size_len = self.page_len if self.page_len else self.block_len
+        slen = np.asarray(
+            [size_len[i % length] for i in range(base.shape[0])],
+            dtype=np.int64,
+        )
         n = len(chunks)
         starts = np.fromiter((c[0] for c in chunks), dtype=np.int64, count=n)
         spans = np.fromiter((c[1] for c in chunks), dtype=np.int64, count=n) - starts
@@ -331,18 +362,19 @@ class RankLocalStoreLayout(StoreLayout):
         )
         addrs = base[None, :] + bids[:, None] * blen[None, :]
         block_counts = (spans + self.block_size - 1) // self.block_size
-        sizes = blen[None, :] * block_counts[:, None]
+        sizes = slen[None, :] * block_counts[:, None]
         return addrs.tolist(), sizes.tolist(), bids.tolist()
 
     def prepare_value_for_block(self, block_id: int) -> tuple[list[int], list[int]]:
         length = len(self.block_len)
+        size_len = self.page_len if self.page_len else self.block_len
         return (
             [
                 base_addr + block_id * self.block_len[index % length]
                 for index, base_addr in enumerate(self.kv_caches_base_addr)
             ],
             [
-                self.block_len[index % length]
+                size_len[index % length]
                 for index in range(len(self.kv_caches_base_addr))
             ],
         )

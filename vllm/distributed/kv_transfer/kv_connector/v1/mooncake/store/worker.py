@@ -52,6 +52,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     MooncakeStoreConnectorMetadata,
     MooncakeStoreWorkerMetadata,
     PoolKey,
+    RankLocalStoreLayout,
     ReqMeta,
     StoreShardId,
     TailKeyBoundary,
@@ -154,6 +155,92 @@ def _estimate_disk_offload_staging_bytes(size_list: list[int]) -> int:
 
 def _sum_batch_bytes(sizes: list[list[int]]) -> int:
     return sum(sum(size) for size in sizes)
+
+
+def _host_stage_bytes() -> int:
+    """Size of the pinned host staging buffer; 0 disables host staging."""
+    try:
+        mb = int(os.getenv("VLLM_MOONCAKE_HOST_STAGE_MB", "32"))
+    except ValueError:
+        mb = 32
+    return max(0, mb) * 1024 * 1024
+
+
+class HostStagedTransfer:
+    """Pinned host staging surface registered with Mooncake instead of VRAM.
+
+    Registering the multi-GiB KV cache itself with an RDMA device whose
+    accumulated 4 KiB MR PTE budget is small (e.g. the AMD Pensando ionic NIC)
+    breaks the HIP runtime: later code-object loads fail with
+    ``hipErrorNoBinaryForGpu`` and queue allocations with
+    ``HSA_STATUS_ERROR_OUT_OF_RESOURCES``. Blocks are therefore staged through
+    this small registered host buffer, which stays inside the PTE budget.
+    """
+
+    def __init__(self, size_bytes: int) -> None:
+        self.buffer = torch.empty(size_bytes, dtype=torch.uint8, pin_memory=True)
+        self.size = size_bytes
+        self.ptr = self.buffer.data_ptr()
+        self._storages: list[tuple[int, int, torch.Tensor]] = []
+        self._seen_storages: set[int] = set()
+
+    def add_gpu_storage(self, cache: torch.Tensor) -> None:
+        storage = cache.untyped_storage()
+        base = storage.data_ptr()
+        if base in self._seen_storages:
+            return
+        self._seen_storages.add(base)
+        view = torch.empty(0, dtype=torch.uint8, device=cache.device)
+        view.set_(storage, 0, (storage.nbytes(),), (1,))
+        self._storages.append((base, storage.nbytes(), view))
+
+    def _gpu_view(self, addr: int, size: int) -> torch.Tensor:
+        for base, nbytes, view in self._storages:
+            if base <= addr and addr + size <= base + nbytes:
+                offset = addr - base
+                return view[offset : offset + size]
+        raise RuntimeError(
+            f"Mooncake host staging: address {addr:#x} is not part of the KV cache"
+        )
+
+    def plan(
+        self, addrs: list[list[int]], sizes: list[list[int]]
+    ) -> tuple[list[list[int]], list[list[tuple[int, int, int]]]]:
+        """Lay out one batch in the staging buffer.
+
+        Returns the per-key host addresses to hand to the store and a per-key
+        copy plan of ``(gpu_addr, host_offset, size)`` tuples.
+        """
+        host_addrs: list[list[int]] = []
+        copies: list[list[tuple[int, int, int]]] = []
+        offset = 0
+        for key_addrs, key_sizes in zip(addrs, sizes, strict=True):
+            row_addrs: list[int] = []
+            row_copies: list[tuple[int, int, int]] = []
+            for addr, size in zip(key_addrs, key_sizes, strict=True):
+                if offset + size > self.size:
+                    raise RuntimeError(
+                        "Mooncake host staging buffer too small for one batch; "
+                        "raise VLLM_MOONCAKE_HOST_STAGE_MB"
+                    )
+                row_addrs.append(self.ptr + offset)
+                row_copies.append((addr, offset, size))
+                offset += size
+            host_addrs.append(row_addrs)
+            copies.append(row_copies)
+        return host_addrs, copies
+
+    def copy_out(self, copies: list[list[tuple[int, int, int]]]) -> None:
+        """Stage KV blocks from GPU memory into the host buffer."""
+        for row in copies:
+            for addr, offset, size in row:
+                self.buffer[offset : offset + size].copy_(self._gpu_view(addr, size))
+
+    def copy_in(self, copies: list[list[tuple[int, int, int]]]) -> None:
+        """Write loaded KV blocks from the host buffer back into GPU memory."""
+        for row in copies:
+            for addr, offset, size in row:
+                self._gpu_view(addr, size).copy_(self.buffer[offset : offset + size])
 
 
 def _get_usable_disk_offload_buffer_budget_bytes(raw_budget_bytes: int) -> int:
@@ -413,6 +500,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         supports_group_ids: bool = False,
         record_operation: Callable[..., None] | None = None,
         group_participates: Sequence[bool] | None = None,
+        host_stage: "HostStagedTransfer | None" = None,
     ):
         super().__init__(
             store,
@@ -423,6 +511,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             name="KVCacheStoreSendingThread",
             record_operation=record_operation,
         )
+        self.host_stage = host_stage
         # Only ranks with identical group bytes may stripe PUTs (e.g., MLA).
         self.group_put_steps = group_put_steps
         self.coord = coord
@@ -468,6 +557,50 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 request.store_job_id
             )
         super().add_request(request)
+
+    def _batch_put(
+        self,
+        keys: list[str],
+        addrs: list[list[int]],
+        sizes: list[list[int]],
+        group_ids: list[str] | None,
+    ) -> list[int]:
+        """PUT one batch, staging through the host buffer when enabled."""
+        if self.host_stage is None:
+            return self.store.batch_put_from_multi_buffers(
+                keys,
+                addrs,
+                sizes,
+                self.replicate_config,
+            )
+
+        capacity = self.host_stage.size
+        batches, oversize_key = _split_disk_offload_load_batches(
+            keys, addrs, sizes, capacity, capacity
+        )
+        if oversize_key is not None:
+            raise RuntimeError(
+                f"KV block {oversize_key} is larger than the host staging buffer "
+                f"({capacity} bytes); raise VLLM_MOONCAKE_HOST_STAGE_MB"
+            )
+
+        results = [0] * len(keys)
+        offset = 0
+        for batch_keys, batch_addrs, batch_sizes in batches:
+            count = len(batch_keys)
+            host_addrs, copies = self.host_stage.plan(batch_addrs, batch_sizes)
+            self.host_stage.copy_out(copies)
+            if group_ids is not None:
+                self.replicate_config.group_ids = group_ids[offset : offset + count]
+            sub_results = self.store.batch_put_from_multi_buffers(
+                batch_keys,
+                host_addrs,
+                batch_sizes,
+                self.replicate_config,
+            )
+            results[offset : offset + count] = list(sub_results)
+            offset += count
+        return results
 
     def is_live_store_job(self, req_meta: ReqMeta) -> bool:
         with self.done_task_lock:
@@ -922,14 +1055,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
             failed_indices: set[int] = set()
             put_had_exception = False
             batch_bytes = _sum_batch_bytes(sizes)
+            logger.info(
+                "Mooncake store put: req=%s, keys=%d, bytes=%d",
+                req_id,
+                len(keys),
+                batch_bytes,
+            )
             put_start = time.perf_counter()
             try:
-                res = self.store.batch_put_from_multi_buffers(
-                    keys,
-                    addrs,
-                    sizes,
-                    self.replicate_config,
-                )
+                res = self._batch_put(keys, addrs, sizes, group_ids)
             except Exception as e:
                 self._record_operation(
                     "save_put",
@@ -1061,6 +1195,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         request_queue: queue.Queue[Any] | None = None,
         group_participates: Sequence[bool] | None = None,
         is_hma_required: bool = False,
+        host_stage: "HostStagedTransfer | None" = None,
     ):
         super().__init__(
             store,
@@ -1072,6 +1207,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             record_operation=record_operation,
             request_queue=request_queue,
         )
+        self.host_stage = host_stage
         self.group_participates = (
             list(group_participates)
             if group_participates is not None
@@ -1093,6 +1229,45 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             )
         )
         self.coord = coord
+
+    def _batch_get(
+        self,
+        keys: list[str],
+        addrs: list[list[int]],
+        sizes: list[list[int]],
+    ) -> list[int]:
+        """GET one batch, staging through the host buffer when enabled."""
+        if self.host_stage is None:
+            return self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
+
+        capacity = self.host_stage.size
+        batches, oversize_key = _split_disk_offload_load_batches(
+            keys, addrs, sizes, capacity, capacity
+        )
+        if oversize_key is not None:
+            raise RuntimeError(
+                f"KV block {oversize_key} is larger than the host staging buffer "
+                f"({capacity} bytes); raise VLLM_MOONCAKE_HOST_STAGE_MB"
+            )
+
+        results = [0] * len(keys)
+        offset = 0
+        for batch_keys, batch_addrs, batch_sizes in batches:
+            count = len(batch_keys)
+            host_addrs, copies = self.host_stage.plan(batch_addrs, batch_sizes)
+            sub_results = self.store.batch_get_into_multi_buffers(
+                batch_keys, host_addrs, batch_sizes
+            )
+            results[offset : offset + count] = list(sub_results)
+            ok_copies = [
+                row
+                for row, value in zip(copies, sub_results, strict=True)
+                if value >= 0
+            ]
+            if ok_copies:
+                self.host_stage.copy_in(ok_copies)
+            offset += count
+        return results
 
     def _add_load_error_block_ids(self, block_ids: list[int]) -> None:
         with self._invalid_block_ids_lock:
@@ -1258,9 +1433,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     tiers_by_key = _get_replica_tiers_by_key(self.store, batch_keys)
                 # Reset so the recorded RPC duration excludes tier lookup.
                 load_get_start = time.perf_counter()
-                res = self.store.batch_get_into_multi_buffers(
-                    batch_keys, batch_addrs, batch_sizes
-                )
+                res = self._batch_get(batch_keys, batch_addrs, batch_sizes)
                 if tiers_by_key is not None:
                     _log_mooncake_load_tier_summary(
                         req_id, batch_keys, res, tiers_by_key
@@ -1733,6 +1906,11 @@ class MooncakeStoreWorker:
         """Register KV cache tensors and start transfer threads."""
         if self._capacity_only:
             return
+        # Registrations are only collected here; the RDMA registration itself
+        # is deferred to `_ensure_buffers_registered`.
+        self._pending_registrations: list[tuple[int, int, str]] = []
+        self._buffers_registered = False
+        self._register_lock = threading.Lock()
         if not kv_caches:
             logger.warning("No KV caches to offload.")
             return
@@ -1748,6 +1926,24 @@ class MooncakeStoreWorker:
         assert self.cache_config.num_gpu_blocks is not None
         self.num_blocks = self.cache_config.num_gpu_blocks
         use_group_regions = self._kv_cache_config.hisparse_host_num_blocks is not None
+
+        # Stage transfers through a small pinned host buffer unless disabled.
+        # Registering the KV cache VRAM itself breaks HIP on NICs with a small
+        # accumulated 4 KiB MR PTE budget (see HostStagedTransfer).
+        self.host_stage: HostStagedTransfer | None = None
+        stage_bytes = _host_stage_bytes()
+        if stage_bytes > 0:
+            self.host_stage = HostStagedTransfer(stage_bytes)
+            for value in kv_caches.values():
+                for tensor in value if isinstance(value, list) else [value]:
+                    self.host_stage.add_gpu_storage(tensor)
+            self._pending_registrations.append(
+                (self.host_stage.ptr, self.host_stage.size, "host")
+            )
+            logger.info(
+                "Mooncake host staging enabled: %d MiB pinned buffer",
+                stage_bytes // (1024 * 1024),
+            )
 
         if not use_group_regions:
             store_layer_names = {
@@ -1767,17 +1963,45 @@ class MooncakeStoreWorker:
                 if base_addr in seen_storage_ptrs:
                     continue
                 seen_storage_ptrs.add(base_addr)
-                region_len = cache_storage.nbytes()
-                ret = self.store.register_buffer(base_addr, region_len)
-                if ret != 0:
-                    logger.error(
-                        "register_buffer failed for addr %#x len %d: %d",
-                        base_addr,
-                        region_len,
-                        ret,
+                if self.host_stage is None:
+                    self._pending_registrations.append(
+                        (base_addr, cache_storage.nbytes(), "device")
                     )
-            for db in self.token_dbs:
-                db.store_layout.register_kv_caches(cache_tensors, self.num_blocks)
+            layer_page_bytes: dict[str, int] = {}
+            for tensor in self._kv_cache_config.kv_cache_tensors:
+                page_bytes = min(tensor.layer_stride, tensor.block_stride)
+                for name in tensor.layers:
+                    layer_page_bytes[name] = page_bytes
+
+            for group, db in zip(self._kv_cache_groups, self.token_dbs, strict=True):
+                group_layer_names = set(group.layer_names)
+                group_tensors = []
+                group_pages = []
+                for layer_name, cache in kv_caches.items():
+                    if layer_name not in group_layer_names:
+                        continue
+                    group_tensors.append(
+                        group_kernel_blocks(_repr_tensor(cache), self.num_blocks)
+                    )
+                    group_pages.append(layer_page_bytes.get(layer_name))
+                layout = db.store_layout
+                if isinstance(layout, RankLocalStoreLayout) and all(
+                    page is not None for page in group_pages
+                ):
+                    layout.register_kv_caches(
+                        group_tensors, self.num_blocks, group_pages
+                    )
+                else:
+                    layout.register_kv_caches(group_tensors, self.num_blocks)
+                if isinstance(layout, RankLocalStoreLayout):
+                    logger.info(
+                        "Mooncake store layout: block_size=%d, %d entries, "
+                        "block_len[:3]=%s, page_len[:3]=%s",
+                        db.block_size,
+                        len(layout.block_len),
+                        layout.block_len[:3],
+                        layout.page_len[:3],
+                    )
 
         registered_buffers: dict[int, int] = {}
         num_host_segments = 0
@@ -1826,12 +2050,13 @@ class MooncakeStoreWorker:
 
                 registered_len = registered_buffers.get(base_addr)
                 if registered_len is None:
-                    ret = self.store.register_buffer(base_addr, region_len)
-                    if ret != 0:
-                        mem_kind = "host" if is_host_resident else "device"
-                        raise RuntimeError(
-                            "Mooncake register_buffer failed for addr "
-                            f"{base_addr:#x} len {region_len} ({mem_kind}): {ret}"
+                    if self.host_stage is None:
+                        self._pending_registrations.append(
+                            (
+                                base_addr,
+                                region_len,
+                                "host" if is_host_resident else "device",
+                            )
                         )
                     registered_buffers[base_addr] = region_len
                 elif registered_len != region_len:
@@ -1901,6 +2126,7 @@ class MooncakeStoreWorker:
                     group.kv_cache_spec.prefix_cacheable
                     for group in self._kv_cache_groups
                 ],
+                host_stage=self.host_stage,
             )
             self.kv_send_thread.start()
 
@@ -1923,6 +2149,7 @@ class MooncakeStoreWorker:
                     for group in self._kv_cache_groups
                 ],
                 is_hma_required=self._is_hma_required,
+                host_stage=self.host_stage,
             )
             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
             recv_thread.start()
@@ -1934,6 +2161,36 @@ class MooncakeStoreWorker:
             "Started %d Mooncake KV-load receive thread(s)", self.num_recv_threads
         )
 
+    def _ensure_buffers_registered(self) -> None:
+        """Register the KV cache memory with the store on first use.
+
+        Registering GPU memory with the RDMA device before every Triton kernel
+        is loaded makes subsequent HIP code-object loads fail with "no kernel
+        image is available for execution on the device" (hipErrorNoBinaryForGpu,
+        209), so registration is deferred past warmup and graph capture.
+        """
+        if getattr(self, "_buffers_registered", False):
+            return
+        if not hasattr(self, "_register_lock"):
+            self._register_lock = threading.Lock()
+            self._pending_registrations = []
+            self._buffers_registered = False
+        with self._register_lock:
+            if self._buffers_registered:
+                return
+            for base_addr, region_len, mem_kind in self._pending_registrations:
+                ret = self.store.register_buffer(base_addr, region_len)
+                if ret != 0:
+                    raise RuntimeError(
+                        "Mooncake register_buffer failed for addr "
+                        f"{base_addr:#x} len {region_len} ({mem_kind}): {ret}"
+                    )
+            self._buffers_registered = True
+            logger.info(
+                "Registered %d KV cache segment(s) with Mooncake",
+                len(self._pending_registrations),
+            )
+
     def start_load_kv(self, metadata: MooncakeStoreConnectorMetadata):
         """Issue async loads.
 
@@ -1943,6 +2200,7 @@ class MooncakeStoreWorker:
         """
         if self._capacity_only:
             return
+        self._ensure_buffers_registered()
 
         for request in metadata.requests:
             load_spec = request.load_spec
@@ -1961,6 +2219,7 @@ class MooncakeStoreWorker:
         """
         if self._capacity_only or not self.can_put:
             return
+        self._ensure_buffers_registered()
 
         current_event = None
         for request in metadata.requests:
@@ -2103,6 +2362,7 @@ class MooncakeStoreWorker:
         """
         if self._capacity_only:
             return MooncakeLookupResult(0)
+        self._ensure_buffers_registered()
 
         token_len = self.coord.align_lookup_length(num_tokens)
         if not block_hashes or token_len <= 0:
