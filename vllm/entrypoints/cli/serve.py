@@ -144,16 +144,32 @@ class ServeSubcommand(CLISubcommand):
             )
             args.api_server_count = 1
 
-        if is_multi_port:
-            run_dp_supervisor(args)
-        elif args.api_server_count < 1:
-            run_headless(args)
-        elif args.api_server_count > 1 or rust_frontend_path:
-            run_multi_api_server(args)
-        else:
-            # Single API server (this process).
-            args.api_server_count = None
-            uvloop.run(run_server(args))
+        try:
+            if is_multi_port:
+                run_dp_supervisor(args)
+            elif args.api_server_count < 1:
+                run_headless(args)
+            elif args.api_server_count > 1 or rust_frontend_path:
+                run_multi_api_server(args)
+            else:
+                # Single API server (this process).
+                args.api_server_count = None
+                uvloop.run(run_server(args))
+        except KeyboardInterrupt:
+            raise
+        except SystemExit:
+            raise
+        except BaseException:
+            # A dead engine/API-server process leaves reparented workers behind; the
+            # generic exit path then blocks in multiprocessing's atexit join, so the
+            # container never restarts and orphans keep GPU memory. Exit hard instead.
+            logger.exception(
+                "Fatal error in engine/API-server supervision; killing all child "
+                "processes and exiting so the instance can be restarted"
+            )
+            from vllm.utils.system_utils import fatal_exit
+
+            fatal_exit(1)
 
     def validate(self, args: argparse.Namespace) -> None:
         validate_parsed_serve_args(args)

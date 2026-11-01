@@ -10,6 +10,7 @@ import os
 import signal
 import sys
 from collections.abc import Callable, Iterator
+from typing import NoReturn
 from pathlib import Path
 
 import psutil
@@ -202,6 +203,31 @@ def decorate_logs(
         process_name = get_mp_context().current_process().name
 
     set_vllm_process_name(process_name, skip_if_set=skip_if_decorated)
+
+
+def fatal_exit(exit_code: int = 1) -> NoReturn:
+    """SIGKILL every descendant of this process, then exit without atexit hooks.
+
+    When an engine core dies, its workers can be reparented to PID 1 (this process
+    inside a container) and keep running. A plain ``sys.exit()`` then blocks forever
+    in multiprocessing's atexit hook, which joins non-daemon children without a
+    timeout: the container stays "up" while orphans pin GPU memory and spam the
+    TCPStore heartbeat thread, so no supervisor ever restarts the instance. Kill the
+    tree and bypass atexit so the process (and container) can exit promptly.
+    """
+    logger.error(
+        "Fatal engine failure: killing all descendant processes and hard-exiting"
+    )
+    try:
+        me = psutil.Process()
+        children = me.children(recursive=True)
+    except Exception:  # noqa: BLE001
+        children = []
+    for child in children:
+        with contextlib.suppress(Exception):
+            logger.warning("Fatal exit: SIGKILL %s pid %d", child.name(), child.pid)
+            os.kill(child.pid, signal.SIGKILL)
+    os._exit(exit_code)
 
 
 def kill_process_tree(pid: int):
