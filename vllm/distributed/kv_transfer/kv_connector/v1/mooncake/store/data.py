@@ -667,8 +667,15 @@ class ChunkedTokenDatabase:
         assert put_step > 0
         if not block_hashes:
             return
-        assert token_len % self.hash_block_size == 0
-        assert token_len // self.hash_block_size <= len(block_hashes)
+        # Speculative decode / partial chunked prefill can leave token_len off
+        # the hash grid (or beyond the hashed prefix). Only process the fully
+        # hashed prefix instead of asserting: the unhashed tail is simply not
+        # shared through the store, so it is recomputed by the consumer.
+        max_hashed = len(block_hashes) * self.hash_block_size
+        if token_len % self.hash_block_size != 0 or token_len > max_hashed:
+            token_len = min(token_len - token_len % self.hash_block_size, max_hashed)
+        if token_len <= 0:
+            return
         start_chunk = max(0, cdiv(mask_num, self.block_size))
         max_chunks = cdiv(token_len, self.block_size)
         if chunk_mask is not None:
